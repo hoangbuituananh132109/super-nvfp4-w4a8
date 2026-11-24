@@ -1,0 +1,7 @@
+__pycache__/
+*.pt
+modal_runs/*-submission.json
+modal_runs/*-result.json
+modal_runs/*-PASS.json
+*.log
+.pytest_cache/

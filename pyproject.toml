@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "super-nvfp4-w4a8"
+version = "0.1.0"
+description = "NVFP4 (group16/E4M3 + global) weight storage x FP8 activation fused MoE for Hopper (SM90), Triton, vLLM plugin for Nemotron-3 Super (non-gated ReLU2)"
+requires-python = ">=3.10"
+dependencies = []  # torch / triton / vllm come from the vLLM image; do not pin here
+
+[project.entry-points."vllm.general_plugins"]
+super_nvfp4_w4a8 = "super_nvfp4_w4a8.vllm_plugin:register"
+
+[tool.setuptools]
+packages = ["super_nvfp4_w4a8"]
