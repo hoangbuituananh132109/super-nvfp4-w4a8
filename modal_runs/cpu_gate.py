@@ -265,6 +265,22 @@ def check_compile(res):
             v["compile_error"] = repr(e)[:1500]
             out["compile_errors"].append(name)
         out["decode"][name] = v
+    from super_nvfp4_w4a8.dense_fp8 import _marlin_tile_decode_ms_kernel
+    for T, w in ((8, 2), (4, 2), (8, 4)):
+        name = f"mtile_ms_T{T}_w{w}"
+        sig6 = {"q_ptr": "*i32", "ms_ptr": "*u8", "shift_ptr": "*i8", "out_ptr": "*fp8e4nv", "N": "i32",
+                "K": "i32", "T": "constexpr"}
+        v = {}
+        try:
+            ck = _compile(_marlin_tile_decode_ms_kernel, sig6, {"T": T}, tgt, {"num_warps": w},
+                          div16=("q_ptr", "ms_ptr", "shift_ptr", "out_ptr", "N", "K"))
+            ptx = ck.asm["ptx"]
+            v["vec_st"] = sorted(set(re.findall(r"st\.global(?:\.\w+)*\.v\d\.b\d+", ptx)))
+            v.update(_ptxas_stats(ptxas, ptx, name))
+        except Exception as e:  # noqa: BLE001
+            v["compile_error"] = repr(e)[:1500]
+            out["compile_errors"].append(name)
+        out["decode"][name] = v
     from super_nvfp4_w4a8.dense_fp8 import _marlin_tile_decode_kernel, MARLIN_TILE_SWEEP
     for T, w in MARLIN_TILE_SWEEP:
         name = f"mtile_T{T}_w{w}"
@@ -283,6 +299,41 @@ def check_compile(res):
             v["compile_error"] = repr(e)[:1500]
             out["compile_errors"].append(name)
         out["decode"][name] = v
+    # fused W4A8 GEMM reading Marlin codes/scales (marlin_w4a8.py): compile + IR shape, informational
+    from super_nvfp4_w4a8.marlin_w4a8 import marlin_w4a8_moe_gemm
+    out["fused_marlin"] = {}
+    sig7 = {"a_ptr": "*fp8e4nv", "a_scale_ptr": "*fp32", "q_ptr": "*i32", "ms_ptr": "*u8", "shift_ptr": "*i8",
+            "bscale_ptr": "*fp32", "c_ptr": "*bf16", "topk_w_ptr": "*fp32", "sorted_ids_ptr": "*i32",
+            "expert_ids_ptr": "*i32", "num_post_pad_ptr": "*i32", "N": "i32", "K": "i32",
+            "num_valid_slots": "i32", "stride_am": "i32", "stride_cm": "i32"}
+    for k in ("A_ROW_DIV", "MUL_ROUTED_WEIGHT", "BLOCK_M", "NT", "T", "GROUP_N"):
+        sig7[k] = "constexpr"
+    for bm, nt, T, w, st in ((16, 2, 8, 8, 3), (16, 1, 8, 4, 3), (32, 2, 8, 8, 3), (64, 2, 8, 8, 3),
+                             (16, 2, 4, 8, 4), (64, 1, 8, 4, 3)):
+        name = f"fm_bm{bm}_nt{nt}_T{T}_w{w}_s{st}"
+        v = {}
+        try:
+            ck = _compile(marlin_w4a8_moe_gemm, dict(sig7),
+                          dict(A_ROW_DIV=22, MUL_ROUTED_WEIGHT=False, BLOCK_M=bm, NT=nt, T=T, GROUP_N=8),
+                          tgt, {"num_warps": w, "num_stages": st},
+                          div16=("a_ptr", "q_ptr", "ms_ptr", "shift_ptr", "bscale_ptr", "c_ptr", "N", "K",
+                                 "stride_am", "stride_cm"))
+            ptx = ck.asm["ptx"]
+            ttgir = ck.asm.get("ttgir", "")
+            v["wgmma"] = "wgmma" in ptx
+            v["mma_sync"] = "mma.sync" in ptx
+            v["shared"] = getattr(ck.metadata, "shared", None)
+            v["ir"] = {op: ttgir.count(op) for op in ("ttng.warp_group_dot ", "ttg.convert_layout",
+                                                       "ttg.local_alloc", "ttg.local_load", "ttg.async_copy",
+                                                       "tt.load", "tt.dot ")}
+            v["vec_ld"] = sorted(set(re.findall(r"ld\.global(?:\.\w+)*\.v\d\.b\d+", ptx)))
+            v.update(_ptxas_stats(ptxas, ptx, name))
+            if name == "fm_bm16_nt2_T8_w8_s3":
+                Path("fused_marlin.ttgir").write_text(ttgir)
+        except Exception as e:  # noqa: BLE001
+            v["compile_error"] = repr(e)[:1500]
+            out["compile_errors"].append(name)
+        out["fused_marlin"][name] = v
     res["compile"] = out
     assert not out["compile_errors"], f"sm_90a compile failed for {out['compile_errors']}"
     bad = {ub: s for ub, s in out["default_cfg_spills"].items() if s != 0}
@@ -291,11 +342,25 @@ def check_compile(res):
     assert out["gemm_cvt_e4m3"], "no e4m3 cvt in PTX"
 
 
+def check_cuda_ext(res):
+    """nvcc build of cuda_ops (sm_90a) without a GPU; records the toolchain."""
+    import shutil
+    nv = shutil.which("nvcc") or ("/usr/local/cuda/bin/nvcc" if Path("/usr/local/cuda/bin/nvcc").exists() else None)
+    res["cuda_ext"] = {"nvcc": nv}
+    if nv:
+        res["cuda_ext"]["nvcc_version"] = subprocess.run([nv, "--version"], capture_output=True, text=True).stdout[-200:]
+        os.environ["PATH"] = os.path.dirname(nv) + ":" + os.environ.get("PATH", "")
+    os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0a"
+    from super_nvfp4_w4a8.cuda_ops import module
+    module()
+    res["cuda_ext"]["built"] = True
+
+
 def main():
     res = {"status": "RUNNING", "binding": binding(), "checks": {}}
     ok = True
     for name, fn in (("pytest", check_pytest), ("plugin", check_plugin), ("ckpt", check_ckpt),
-                     ("compile", check_compile)):
+                     ("compile", check_compile), ("cuda_ext", check_cuda_ext)):
         try:
             fn(res)
             res["checks"][name] = "PASS"

@@ -5,3 +5,4 @@ modal_runs/*-result.json
 modal_runs/*-PASS.json
 *.log
 .pytest_cache/
+third_party/

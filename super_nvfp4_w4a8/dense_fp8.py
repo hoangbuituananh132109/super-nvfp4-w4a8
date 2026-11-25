@@ -14,6 +14,8 @@ weight, amortised over all tokens of the forward; it only pays off for large M (
 """
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -162,6 +164,70 @@ def _marlin_tile_decode_kernel(q_ptr, srel_ptr, out_ptr, N, K, T: tl.constexpr):
     tl.store(out_ptr + e * N * K + n.to(tl.int64)[:, None] * K + k[None, :], v, mask=km)
 
 
+@triton.jit
+def _marlin_scale_pos(n):
+    """Column of output row n inside vLLM's processed NVFP4 Marlin scale tensor [E, K/16, N]
+    (marlin_permute_scales: 64-chunks permuted by i+8j, then nvfp4_marlin_process_scales swaps
+    elements 1<->2 of every 4). Verified against a numpy emulation of both vLLM steps."""
+    s = n % 64
+    cp = (s % 8) * 8 + s // 8
+    d = cp % 4
+    sw = tl.where(d == 1, 2, tl.where(d == 2, 1, d))
+    return (n // 64) * 64 + cp - d + sw
+
+
+@triton.jit
+def _marlin_tile_decode_ms_kernel(q_ptr, ms_ptr, shift_ptr, out_ptr, N, K, T: tl.constexpr):
+    """Same as _marlin_tile_decode_kernel, but the block scale comes from Marlin's own processed
+    scale byte instead of a separate s_rel tensor. A Marlin byte is the top byte of
+    fp16(S * sf * 2^7) << 1, i.e. unsigned E5M3: value = 2^(E-15) * (1 + M/8), 0 if flushed.
+    S_rel = S / r = value * 2^-shift with shift[e,n] = 7 + log2(sf) + log2(r[e,n]) (all powers of
+    two, so exact in fp32), then one RNE to E4M3 -- identical to fmt.prepare_w4a8's
+    (S / r).to(float8_e4m3fn)."""
+    nt = tl.program_id(0)
+    ktg = tl.program_id(1)
+    e = tl.program_id(2).to(tl.int64)
+    KT = K // 16
+    t = tl.arange(0, T)
+    r = tl.arange(0, 8)
+    kq = tl.arange(0, 4)
+    j = tl.arange(0, 4)
+    kt = ktg * T + t
+    inner = (j[None, None, :] + 4 * kq[None, :, None] + 16 * r[:, None, None])
+    word = (e * KT * (2 * N) + (kt.to(tl.int64) * (2 * N))[:, None, None, None]
+            + nt * 128 + inner[None, :, :, :])
+    w = tl.load(q_ptr + word, mask=(kt < KT)[:, None, None, None], other=0)
+    sh = 4 * tl.arange(0, 8)
+    nib = ((w[:, :, :, :, None] >> sh[None, None, None, None, :]) & 0xF).to(tl.uint8)
+    nib = tl.reshape(nib, (T, 8, 4, 4, 2, 2, 2))
+    codes = tl.reshape(tl.permute(nib, (3, 5, 1, 0, 6, 2, 4)), (64, T * 16))
+    n = nt * 64 + tl.arange(0, 64)
+    k = ktg * T * 16 + tl.arange(0, T * 16)
+    km = (k < K)[None, :]
+    b = tl.load(ms_ptr + e * KT * N + (k // 16).to(tl.int64)[None, :] * N + _marlin_scale_pos(n)[:, None],
+                mask=km, other=0).to(tl.int32)
+    sft = tl.load(shift_ptr + e * N + n).to(tl.int32)
+    ex = (b >> 3) + (127 - 15) - sft[:, None]
+    bits = (ex << 23) | ((b & 7) << 20)
+    bits = tl.where((b == 0) | (ex < 1), 0, bits)
+    sr = bits.to(tl.float32, bitcast=True).to(tl.float8e4nv).to(tl.float16)
+    v = _e2m1x_srel_to_fp8(codes, sr)
+    tl.store(out_ptr + e * N * K + n.to(tl.int64)[:, None] * K + k[None, :], v, mask=km)
+
+
+def decode_marlin_ms_to_fp8(q, ms, shift, N: int, K: int, out=None, T=None, num_warps=None):
+    """Marlin codes [E,K/16,2N] i32 + Marlin scales [E,K/16,N] (bytes) + shift [E,N] i8 -> FP8 [E,N,K]."""
+    E = q.shape[0]
+    if N % 64 or K % 16 or tuple(q.shape) != (E, K // 16, 2 * N) or tuple(ms.shape) != (E, K // 16, N):
+        raise ValueError(f"unexpected Marlin tensors {tuple(q.shape)} {tuple(ms.shape)} for N={N} K={K}")
+    if out is None or out.shape != (E, N, K):
+        out = torch.empty((E, N, K), dtype=torch.float8_e4m3fn, device=q.device)
+    T = T or MARLIN_DECODE_CFG["T"]
+    _marlin_tile_decode_ms_kernel[(N // 64, triton.cdiv(K // 16, T), E)](
+        q, ms.view(torch.uint8), shift, out, N, K, T=T, num_warps=num_warps or MARLIN_DECODE_CFG["num_warps"])
+    return out
+
+
 # tuned on H200, Super layer (bench-0d26c3bf2e): coalesced tile kernel T=8 w2 = 1.61 ms for both matrices
 MARLIN_DECODE_CFG = {"impl": "tile", "block_n": 64, "block_c": 32, "num_warps": 2, "combine": False, "T": 8}
 MARLIN_DECODE_SWEEP = [(bn, bc, w, cb) for bn in (64, 128) for bc in (16, 32) for w in (4, 8)
@@ -222,20 +288,37 @@ def decode_to_fp8(packed: torch.Tensor, s_rel: torch.Tensor, out: torch.Tensor |
     return out
 
 
+_CUDA_DECODE = [None]
+
+
+def _use_cuda_decode() -> bool:
+    """SUPER_W4A8_CUDA_DECODE=1 (default): JIT CUDA decode (cuda_ops.py); falls back to Triton."""
+    if _CUDA_DECODE[0] is None:
+        ok = os.environ.get("SUPER_W4A8_CUDA_DECODE", "1") == "1"
+        if ok:
+            from .cuda_ops import available
+            ok = available()
+        _CUDA_DECODE[0] = ok
+    return _CUDA_DECODE[0]
+
+
 class Fp8DenseMoE:
     """Holds the NVFP4 W4A8 bank (4-bit) and a shared FP8 scratch; runs FP8 grouped GEMMs."""
 
     _scratch: dict = {}
 
-    def __init__(self, w1, w2, marlin_codes=None):
+    def __init__(self, w1, w2, marlin_codes=None, marlin_scales=None):
         # w = (packed [E,N,K/2] u8, s_rel [E,N,K/16] fp8, bscale [E,N] fp32) from fmt.prepare_w4a8
         # marlin_codes = (w13 int32 [E,H/16,2I], w2 int32 [E,I/16,2H]): decode reads these instead
         # of packed (w[0] may be None), so the hybrid path keeps a single copy of the 4-bit codes.
+        # marlin_scales = (s13 [E,H/16,I], s2 [E,I/16,H]) processed Marlin scale bytes; then w[1] is
+        # the per-row int8 shift (see _marlin_tile_decode_ms_kernel) instead of s_rel.
         self.w1, self.w2 = w1, w2
         self.mq = marlin_codes
-        E, I, G1 = w1[1].shape
-        self.E, self.I, self.H = E, I, 16 * G1
-        dev = w1[1].device
+        self.ms = marlin_scales
+        E, I = w1[2].shape
+        self.E, self.I, self.H = E, I, w2[2].shape[1]
+        dev = w1[2].device
         self.b1 = w1[2].float().unsqueeze(-1).contiguous()  # [E, I, 1]
         self.b2 = w2[2].float().unsqueeze(-1).contiguous()  # [E, H, 1]
         self.ab_strides1 = torch.full((E,), self.H, device=dev, dtype=torch.int64)
@@ -245,13 +328,26 @@ class Fp8DenseMoE:
 
     def _buf(self, key, shape):
         b = Fp8DenseMoE._scratch.get(key)
-        dev = self.w1[1].device
+        dev = self.w1[2].device
         if b is None or b.numel() < int(torch.Size(shape).numel()) or b.device != dev:
             b = torch.empty(int(torch.Size(shape).numel()), dtype=torch.float8_e4m3fn, device=dev)
             Fp8DenseMoE._scratch[key] = b
         return b[: int(torch.Size(shape).numel())].view(shape)
 
     def decode(self):
+        if self.ms is not None and _use_cuda_decode():
+            from .cuda_ops import marlin_decode_to_fp8
+            w8_1 = marlin_decode_to_fp8(self.mq[0], self.ms[0], self.w1[1], self.I, self.H,
+                                        self._buf("w1", (self.E, self.I, self.H)))
+            w8_2 = marlin_decode_to_fp8(self.mq[1], self.ms[1], self.w2[1], self.H, self.I,
+                                        self._buf("w2", (self.E, self.H, self.I)))
+            return w8_1, w8_2
+        if self.ms is not None:
+            w8_1 = decode_marlin_ms_to_fp8(self.mq[0], self.ms[0], self.w1[1], self.I, self.H,
+                                           self._buf("w1", (self.E, self.I, self.H)))
+            w8_2 = decode_marlin_ms_to_fp8(self.mq[1], self.ms[1], self.w2[1], self.H, self.I,
+                                           self._buf("w2", (self.E, self.H, self.I)))
+            return w8_1, w8_2
         if self.mq is not None:
             w8_1 = decode_marlin_to_fp8(self.mq[0], self.w1[1], self.I, self.H,
                                         self._buf("w1", (self.E, self.I, self.H)))
@@ -287,12 +383,42 @@ class Fp8DenseMoE:
         mm1 = torch.empty((M * topk, I), dtype=x.dtype, device=x.device)
         ops.cutlass_moe_mm(mm1, a1q, w8_1, a1s, self.b1, offs, ps1, self.ab_strides1, self.ab_strides1,
                            self.c_strides1, True, True)
-        act = torch.empty_like(mm1)
-        apply_moe_activation(MoEActivation.RELU2_NO_MUL, act, mm1)
-        a2q, a2s = ops.scaled_fp8_quant(act, None, use_per_token_if_dynamic=True)
+        if os.environ.get("SUPER_W4A8_FUSED_ACT", "1") == "1":
+            # one pass: relu(x)^2 in fp32 + per-row FP8 quant (replaces torch pow/clamp + vLLM quant,
+            # ~0.7 s per 64k-token prefill on Super); squaring in fp32 is also more exact than bf16
+            from .moe import rowwise_quant
+            a2q, a2s = rowwise_quant(mm1, relu2=True)
+            a2s = a2s.unsqueeze(-1)
+        else:
+            act = torch.empty_like(mm1)
+            apply_moe_activation(MoEActivation.RELU2_NO_MUL, act, mm1)
+            a2q, a2s = ops.scaled_fp8_quant(act, None, use_per_token_if_dynamic=True)
         mm2 = torch.empty((M * topk, H), dtype=x.dtype, device=x.device)
         ops.cutlass_moe_mm(mm2, a2q, w8_2, a2s, self.b2, offs, ps2, self.ab_strides2, self.ab_strides2,
                            self.c_strides2, True, True)
+        out = torch.empty((M, H), dtype=x.dtype, device=x.device)
+        moe_unpermute(out, mm2, topk_weights.float(), inv_perm, efto)
+        return out
+
+    # ------------------------------------------------------------------ torch._scaled_grouped_mm
+    def run_torch(self, x, topk_weights, topk_ids, w8=None, fast_accum=False):
+        """Same numerics as run_cutlass, grouped GEMM = PyTorch's FP8 rowwise grouped GEMM
+        (scale_a per permuted token row, scale_b per (expert, output row))."""
+        from vllm import _custom_ops as ops
+        from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import moe_permute, moe_unpermute
+        from .moe import rowwise_quant
+        w8_1, w8_2 = w8 if w8 is not None else self.decode()
+        M, H = x.shape
+        E, I = self.E, self.I
+        a1q, a1s = ops.scaled_fp8_quant(x, None, use_per_token_if_dynamic=True)
+        a1q, a1s, efto, inv_perm, _ = moe_permute(a1q, a1s, topk_ids, E, E, None)
+        offs = efto[1:].to(torch.int32)
+        gmm = torch._scaled_grouped_mm
+        mm1 = gmm(a1q, w8_1.transpose(-2, -1), a1s.reshape(-1).float(), self.b1.view(E, I), offs=offs,
+                  out_dtype=torch.bfloat16, use_fast_accum=fast_accum)
+        a2q, a2s = rowwise_quant(mm1, relu2=True)
+        mm2 = gmm(a2q, w8_2.transpose(-2, -1), a2s, self.b2.view(E, H), offs=offs,
+                  out_dtype=torch.bfloat16, use_fast_accum=fast_accum)
         out = torch.empty((M, H), dtype=x.dtype, device=x.device)
         moe_unpermute(out, mm2, topk_weights.float(), inv_perm, efto)
         return out
@@ -334,25 +460,45 @@ class HybridNvfp4MoE:
                                 grouped FP8 GEMM, per-token FP8 activations (prefill regime)
 
     The crossover is measured per model by tests/bench_baselines.py (Super H200: ~2k tokens).
-    Memory: with share_codes (default) the decode reads Marlin's repacked codes directly, so the
-    extra state is s_rel (fp8, 1 B per 16 weights) + one fp32 row scale, plus the per-layer FP8
-    scratch shared by all layers (Super: 2.8 GB).
+    Memory: with share_codes (default) the decode reads Marlin's repacked codes and Marlin's
+    processed block scales directly, so the extra state is one int8 shift + one fp32 row scale per
+    output row, plus the per-layer FP8 scratch shared by all layers (Super: 2.8 GB).
     """
 
     def __init__(self, nv1, nv2, dense_min_tokens: int | None = None, share_codes: bool | None = None):
         import os
         from .fmt import prepare_w4a8
         self.thr = int(dense_min_tokens if dense_min_tokens is not None
-                       else os.environ.get("SUPER_W4A8_DENSE_MIN_TOKENS", "3072"))
+                       else os.environ.get("SUPER_W4A8_DENSE_MIN_TOKENS", "2048"))
         share = (os.environ.get("SUPER_W4A8_SHARE_CODES", "1") == "1") if share_codes is None else share_codes
-        p1, p2 = prepare_w4a8(*nv1), prepare_w4a8(*nv2)
         self.marlin = _marlin_prepare(nv1, nv2)
-        if share:  # decode reads Marlin's codes: extra state is only s_rel + row scale
-            self.dense = Fp8DenseMoE((None, p1[1], p1[2]), (None, p2[1], p2[2]),
-                                     marlin_codes=(self.marlin[0], self.marlin[3]))
-        else:
-            self.dense = Fp8DenseMoE(p1, p2)
         self.share_codes = share
+        self.flushed_scales = 0
+        if not share:
+            self.dense = Fp8DenseMoE(prepare_w4a8(*nv1), prepare_w4a8(*nv2))
+            return
+        # Decode reads Marlin's codes AND Marlin's processed scales: the only extra state is an
+        # int8 exponent shift per output row plus the fp32 row scale G*r of the FP8 GEMM epilogue.
+        w13, s13, g13, w2, s2, g2, _ = self.marlin
+        rows = []
+        for nv, gm in ((nv1, g13), (nv2, g2)):
+            E = nv[0].shape[0]
+            s = nv[1].float()
+            g = nv[2].float().reshape(E)
+            smax = s.amax(-1)
+            rexp = torch.where(smax > 0, torch.ceil(torch.log2(6.0 * smax / 448.0)),
+                               torch.zeros_like(smax))
+            # vLLM: g_marlin = g * 2^(126-7) / sf (bf16 activations), sf a common power of two
+            lsf = torch.round(torch.log2(g.double() * 2.0 ** 119 / gm.double().reshape(E)))
+            if not torch.all(lsf == lsf[0]):
+                raise ValueError("Marlin scale factor differs across experts")
+            sf = float(2.0 ** lsf[0].item())
+            # Marlin flushes S*sf*2^7 < 2 to zero; such groups would not reproduce S exactly
+            self.flushed_scales += int(((s > 0) & (s * sf * 128.0 < 2.0)).sum().item())
+            shift = (7 + lsf[0] + rexp).to(torch.int8).contiguous()
+            rows.append((None, shift, (g[:, None] * torch.exp2(rexp)).float().contiguous()))
+            del s
+        self.dense = Fp8DenseMoE(rows[0], rows[1], marlin_codes=(w13, w2), marlin_scales=(s13, s2))
 
     def run_marlin(self, x, topk_weights, topk_ids):
         from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
@@ -363,7 +509,11 @@ class HybridNvfp4MoE:
                                 scalar_types.float4_e2m1f.id, activation=MoEActivation.RELU2_NO_MUL,
                                 global_scale1=g13, global_scale2=g2, workspace=ws)
 
+    gemm = os.environ.get("SUPER_W4A8_GEMM", "cutlass")   # cutlass | torch | torch_fast
+
     def __call__(self, x, topk_weights, topk_ids):
         if x.shape[0] >= self.thr:
-            return self.dense.run_cutlass(x, topk_weights, topk_ids)
+            if self.gemm == "cutlass":
+                return self.dense.run_cutlass(x, topk_weights, topk_ids)
+            return self.dense.run_torch(x, topk_weights, topk_ids, fast_accum=self.gemm == "torch_fast")
         return self.run_marlin(x, topk_weights, topk_ids)

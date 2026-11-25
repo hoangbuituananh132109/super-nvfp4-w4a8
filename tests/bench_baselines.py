@@ -79,7 +79,7 @@ def make_marlin(nv1, nv2, E, H, I, dev):
     return run
 
 
-def make_humming_mxfp4(W1, W2, dev):
+def make_humming_mxfp4(W1, W2, dev, tune=False):
     from flashinfer.fused_moe import ReLU2, cutlass_fused_moe
     from flashinfer.fused_moe.prepare import (_quantize_mxfp4_linear,
                                               preprocess_moe_weights_for_sm90_mixed_gemm_humming)
@@ -104,6 +104,16 @@ def make_humming_mxfp4(W1, W2, dev):
                           use_wfp4afp8_humming=True, use_fused_finalize=True, enable_pdl=False,
                           tune_max_num_tokens=8192, output=out)
         return out
+    if tune:  # what vLLM does at warm-up: FlashInfer autotuner picks tactics per token bucket
+        from flashinfer.autotuner import autotune
+        gen = torch.Generator(device=dev).manual_seed(7)
+        E, top_k = W1.shape[0], 22
+        with autotune(True):
+            for M in (1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192):
+                x = act(M, W2.shape[1], dev, gen)
+                tw, ids = routing(M, E, top_k, dev, gen=gen)
+                run(x, tw, ids)
+        torch.cuda.synchronize()
     return run
 
 
@@ -254,12 +264,80 @@ def make_hybrid(nv1, nv2, thr, res_extra):
         chk[e] = bool(torch.equal(w8[0][e].view(torch.uint8), r1.view(torch.uint8)) and
                       torch.equal(w8[1][e].view(torch.uint8), r2.view(torch.uint8)))
     res_extra["hybrid_share_codes"] = h.share_codes
+    res_extra["hybrid_flushed_scales"] = h.flushed_scales
+    # whole-bank bit-exactness vs the verified packed-layout decode (all experts, both matrices)
+    from super_nvfp4_w4a8 import dense_fp8 as DF
+    f1 = DF.decode_to_fp8(p1[0], p1[1], impl="tile")
+    full = bool(torch.equal(f1.view(torch.uint8), w8[0].view(torch.uint8)))
+    del f1
+    f2 = DF.decode_to_fp8(p2[0], p2[1], impl="tile")
+    full = full and bool(torch.equal(f2.view(torch.uint8), w8[1].view(torch.uint8)))
+    if not full and "diag_hybrid" not in res_extra:
+        res_extra["diag_hybrid"] = _mismatch_diag(w8[1], f2, None, p2[1])
+    del f2
+    res_extra["hybrid_decode_full_bank_exact"] = full
     res_extra["hybrid_decode_bit_exact"] = chk
     res_extra["hybrid_decode_ms"] = bench(lambda: h.dense.decode())
+    try:
+        from super_nvfp4_w4a8.cuda_ops import marlin_decode_to_fp8
+        d = h.dense
+        t1 = DF.decode_marlin_ms_to_fp8(d.mq[0], d.ms[0], d.w1[1], d.I, d.H)
+        t2 = DF.decode_marlin_ms_to_fp8(d.mq[1], d.ms[1], d.w2[1], d.H, d.I)
+        cu = {}
+        for T in (2, 4, 8, 16):
+            for wp in (0,):
+                c1 = marlin_decode_to_fp8(d.mq[0], d.ms[0], d.w1[1], d.I, d.H, T=T, warps=wp)
+                c2 = marlin_decode_to_fp8(d.mq[1], d.ms[1], d.w2[1], d.H, d.I, T=T, warps=wp)
+                ex = bool(torch.equal(c1.view(torch.uint8), t1.view(torch.uint8)) and
+                          torch.equal(c2.view(torch.uint8), t2.view(torch.uint8)))
+                ms_ = bench(lambda: (marlin_decode_to_fp8(d.mq[0], d.ms[0], d.w1[1], d.I, d.H, out=c1, T=T, warps=wp),
+                                     marlin_decode_to_fp8(d.mq[1], d.ms[1], d.w2[1], d.H, d.I, out=c2, T=T, warps=wp)))
+                cu[f"T{T}_w{wp}"] = {"exact_vs_triton": ex, "ms": ms_["median_ms"]}
+                del c1, c2
+        res_extra["cuda_decode"] = cu
+        del t1, t2
+    except Exception:  # noqa: BLE001
+        res_extra["cuda_decode_error"] = traceback.format_exc()[-2500:]
     res_extra["hybrid_thr"] = h.thr
 
     def run(x, tw, ids):
         return h(x, tw, ids)
+    return run
+
+
+def make_fused_marlin(nv1, nv2, cfg):
+    """marlin_w4a8.py: fused NVFP4xFP8 GEMM reading the Marlin tensors; cfg 'bm_nt_T_gn_w_st' or ''."""
+    from super_nvfp4_w4a8.dense_fp8 import HybridNvfp4MoE
+    from super_nvfp4_w4a8.marlin_w4a8 import fused_marlin_w4a8_moe
+    h = HybridNvfp4MoE(nv1, nv2, dense_min_tokens=1 << 30, share_codes=True)
+    c = None
+    if cfg:
+        k = ("BLOCK_M", "NT", "T", "GROUP_N", "num_warps", "num_stages")
+        c = dict(zip(k, (int(v) for v in cfg.split("_"))))
+
+    def run(x, tw, ids):
+        return fused_marlin_w4a8_moe(h.dense, x, tw, ids, c, c)
+    run.dense = h.dense
+    return run
+
+
+def make_hybrid_gemm(nv1, nv2, gemm, thr=1):
+    from super_nvfp4_w4a8.dense_fp8 import HybridNvfp4MoE
+    h = HybridNvfp4MoE(nv1, nv2, dense_min_tokens=thr)
+    h.gemm = gemm
+
+    def run(x, tw, ids):
+        return h(x, tw, ids)
+    return run
+
+
+def make_small_cuda(nv1, nv2, nb):
+    from super_nvfp4_w4a8.dense_fp8 import HybridNvfp4MoE
+    from super_nvfp4_w4a8.cuda_ops import small_w4a8_moe
+    h = HybridNvfp4MoE(nv1, nv2, dense_min_tokens=1 << 30, share_codes=True)
+
+    def run(x, tw, ids):
+        return small_w4a8_moe(h.dense, x, tw, ids, nb=nb or None)
     return run
 
 
@@ -349,9 +427,22 @@ def main():
                 ("A8_DEQ_TRITON_gemm_only", lambda: make_dense(nv1, nv2, "triton", False, res["dense_decode"])),
                 ("A8_OURS_NVFP4", lambda: make_ours(nv1, nv2)),
                 ("HYBRID_NVFP4", lambda: make_hybrid(nv1, nv2, int(os.environ.get("BENCH_HYBRID_THR", "2048")), res["dense_decode"])),
-                ("A8_HUMMING_MXFP4", lambda: make_humming_mxfp4(W1, W2, dev))]
+                ("A8_HUMMING_MXFP4", lambda: make_humming_mxfp4(W1, W2, dev)),
+                ("A8_HUMMING_MXFP4_TUNED", lambda: make_humming_mxfp4(W1, W2, dev, tune=True)),
+                ("A8_FMARLIN", lambda: make_fused_marlin(nv1, nv2, "")),
+                ("HYB_CUTLASS", lambda: make_hybrid_gemm(nv1, nv2, "cutlass")),
+                ("HYB_TORCH", lambda: make_hybrid_gemm(nv1, nv2, "torch")),
+                ("HYB_TORCH_FAST", lambda: make_hybrid_gemm(nv1, nv2, "torch_fast")),
+                ("A8_SMALL_CUDA", lambda: make_small_cuda(nv1, nv2, 0)),
+                ("A8_SMALL_CUDA_nb1", lambda: make_small_cuda(nv1, nv2, 1)),
+                ("A8_SMALL_CUDA_nb2", lambda: make_small_cuda(nv1, nv2, 2)),
+                ("A8_SMALL_CUDA_nb4", lambda: make_small_cuda(nv1, nv2, 4))]
+    for cfg in os.environ.get("BENCH_FM_CFGS", "").split(","):
+        if cfg:
+            builders.append((f"A8_FMARLIN_{cfg}", lambda cfg=cfg: make_fused_marlin(nv1, nv2, cfg)))
     if only:
-        builders = [b for b in builders if b[0] in only.split(",")]
+        builders = [b for b in builders if b[0] in only.split(",") or
+                    (b[0].startswith("A8_FMARLIN_") and "A8_FMARLIN_*" in only.split(","))]
     # R2 (exact W4A8 algorithm of the fused kernel) for DUT-R2 of the dense variants
     from gpu_operator_check import run_ref_r2
     with exact_matmul():
@@ -369,6 +460,24 @@ def main():
             v["acc_vs_R0_M256"] = compare(y0.float(), r0.float())
             v["acc_vs_R2_M256"] = compare(y0.float(), r2.float())
             dump(f"{name} built in {v['prepare_s']:.1f}s, accuracy done")
+            if os.environ.get("BENCH_KPROF"):
+                v["kprof"] = {}
+                for M in (int(m) for m in os.environ["BENCH_KPROF"].split(",")):
+                    x = act(M, H, dev, gen)
+                    tw, ids = routing(M, E, top_k, dev, gen=gen)
+                    for _ in range(3):
+                        run(x, tw, ids)
+                    torch.cuda.synchronize()
+                    from torch.profiler import profile, ProfilerActivity
+                    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                        for _ in range(5):
+                            run(x, tw, ids)
+                        torch.cuda.synchronize()
+                    dt = lambda e: getattr(e, "device_time_total", None) or getattr(e, "cuda_time_total", 0)  # noqa: E731
+                    rows = [(e.key, dt(e) / 5 / 1e3, e.count // 5) for e in prof.key_averages() if dt(e) > 0]
+                    rows.sort(key=lambda r: -r[1])
+                    v["kprof"][M] = [{"k": k[:160], "ms": round(t, 4), "n": n} for k, t, n in rows[:12]]
+                dump(f"{name} kprof {json.dumps(v['kprof'])[:1500]}")
             for M in sorted((int(m) for m in a.Ms.split(",")), reverse=True):  # large M first
                 x = act(M, H, dev, gen)
                 tw, ids = routing(M, E, top_k, dev, gen=gen)

@@ -8,6 +8,10 @@ checkpoint's exclude list, MTP). Weight loading of the routed experts is the sto
 ModelOpt NVFP4 MoE loader; only ``process_weights_after_loading`` and ``apply`` differ.
 
 Env:
+  SUPER_W4A8_MODE=hybrid|fused  hybrid (default): M < SUPER_W4A8_DENSE_MIN_TOKENS (2048) -> stock Marlin
+                              W4A16, else NVFP4->FP8 decode (CUDA) + CUTLASS FP8 grouped GEMM.
+                              fused: the original all-Triton W4A8 kernel (slow, reference only)
+  SUPER_W4A8_CUDA_DECODE=1    JIT CUDA decode kernel (cuda_ops.py); 0 = Triton decode
   SUPER_W4A8_MTP=stock|w4a8   MTP routed experts (default stock = vLLM's own NVFP4 backend)
   SUPER_W4A8_CHUNK=8192       token chunk for the expert workspace
   SUPER_W4A8_CONFIG=path.json tuned tile table produced by bench/tune.py
@@ -35,7 +39,7 @@ def register():
     from .fmt import prepare_w4a8, weight_conversion_error
     from .moe import nvfp4_w4a8_moe
 
-    class SuperNvfp4W4A8MoEMethod(FusedMoEMethodBase):
+    class SuperModelOptNvFp4W4A8MoEMethod(FusedMoEMethodBase):
         def __init__(self, inner, moe):
             super().__init__(moe)
             if getattr(moe, "is_act_and_mul", False) or getattr(moe, "has_bias", False):
@@ -53,6 +57,15 @@ def register():
         def topk_indices_dtype(self):
             return torch.int32
 
+        # vLLM 0.33 RoutedExperts.weight_loader picks the ModelOpt scale-loading path by class
+        # name ("ModelOpt" in name) and then queries these on the quant method itself.
+        def uses_weight_scale_2_pattern(self):
+            return self.inner.uses_weight_scale_2_pattern()
+
+        @property
+        def use_global_sf(self):
+            return getattr(self.inner, "use_global_sf", False)
+
         def create_weights(self, layer, *args, **kwargs):
             # stock ModelOpt NVFP4 parameters + loaders (no conversion at load time)
             return self.inner.create_weights(layer, *args, **kwargs)
@@ -66,7 +79,7 @@ def register():
             cap = torch.cuda.get_device_capability()
             if cap < (8, 9):
                 raise RuntimeError(f"FP8 tensor cores required (SM89+), got SM{cap[0]}{cap[1]}")
-            if os.environ.get("SUPER_W4A8_MODE", "fused") == "hybrid":
+            if os.environ.get("SUPER_W4A8_MODE", "hybrid") == "hybrid":
                 # small M: stock Marlin W4A16; large M: NVFP4->FP8 decode + CUTLASS (dense_fp8.py)
                 from .dense_fp8 import HybridNvfp4MoE
                 raw = []
@@ -79,15 +92,28 @@ def register():
                     raw.append((packed, scale, g.reshape(packed.shape[0], -1)[:, 0].contiguous()))
                 self._hybrid = HybridNvfp4MoE(raw[0], raw[1])
                 self._w = ("hybrid",)
-                if self._hybrid.share_codes:  # Marlin + decode own copies now; drop checkpoint codes
-                    for pfx in ("w13", "w2"):
-                        getattr(layer, f"{pfx}_weight").data = torch.empty(0, dtype=torch.uint8,
-                                                                            device=raw[0][0].device)
+                if self._hybrid.share_codes:
+                    # Marlin owns repacked codes + processed scales and the decode reads those, so
+                    # every checkpoint-layout expert tensor can go (codes, block scales, globals,
+                    # unused W4A4 input scales).
+                    dev = raw[0][0].device
+                    for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale",
+                                 "w13_weight_scale_2", "w2_weight_scale_2", "w13_input_scale",
+                                 "w2_input_scale"):
+                        p = getattr(layer, name, None)
+                        if p is not None:
+                            p.data = torch.empty(0, dtype=p.dtype, device=dev)
                     del raw
                     torch.cuda.empty_cache()
+                if self._hybrid.flushed_scales:
+                    print(f"SUPER_W4A8_WARN {getattr(layer, 'layer_name', '?')} "
+                          f"{self._hybrid.flushed_scales} block scales flushed to 0 by Marlin", flush=True)
                 if _READY_LOGGED[0] < 2:
+                    from .dense_fp8 import _use_cuda_decode  # builds the CUDA ext now, not in the first forward
                     print(f"SUPER_NVFP4_W4A8_READY {getattr(layer, 'layer_name', 'routed_experts')} "
-                          f"hybrid dense_min_tokens={self._hybrid.thr}", flush=True)
+                          f"hybrid dense_min_tokens={self._hybrid.thr} share_codes={self._hybrid.share_codes} "
+                          f"cuda_decode={_use_cuda_decode()} gemm={self._hybrid.gemm} "
+                          f"fused_act={os.environ.get('SUPER_W4A8_FUSED_ACT', '1')}", flush=True)
                     _READY_LOGGED[0] += 1
                 return
             mats = []
@@ -142,7 +168,7 @@ def register():
                 return base
             if "mtp" in prefix.split(".") and os.environ.get("SUPER_W4A8_MTP", "stock") != "w4a8":
                 return base
-            return SuperNvfp4W4A8MoEMethod(base, layer.moe_config)
+            return SuperModelOptNvFp4W4A8MoEMethod(base, layer.moe_config)
         return get_quant_method
 
     _subclass_cache = {}

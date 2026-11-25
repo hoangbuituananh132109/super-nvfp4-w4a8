@@ -50,10 +50,13 @@ image = ((modal.Image.from_registry(BASE[len("registry:"):]).entrypoint([])
            .run_commands("ln -sf /usr/bin/python3 /usr/local/bin/python && python --version")
           if BASE.startswith("registry:") else modal.Image.from_id(BASE))
          .run_commands("/usr/bin/python3 -m pip install -q pytest safetensors")
+         # lm-eval in its own venv (talks to the vLLM server over HTTP; must not touch vLLM's deps)
+         .run_commands("/usr/bin/python3 -m venv /opt/lmeval && /opt/lmeval/bin/pip install -q 'lm-eval[api]==0.4.9'")
          .add_local_dir(str(REPO), "/probe/w4a8", copy=True,
                         ignore=["**/__pycache__/**", "**/*.json", "**/*.pt", "**/*.log", "**/*.ptx",
                                 ".git/**", ".pytest_cache/**"])
-         .run_commands("/usr/bin/python3 -m pip install --no-deps --no-build-isolation /probe/w4a8"))
+         .run_commands("/usr/bin/python3 -m pip install --no-deps --no-build-isolation /probe/w4a8 "
+                       "/probe/w4a8/third_party/super_mxfp4a8"))
 
 
 def binding():
@@ -90,7 +93,7 @@ def cpu_stage(attempt, cfg):
     try:
         native(["/usr/bin/python3", "-u", "modal_runs/cpu_gate.py", str(d / "result.json")], 1100,
                env={"NVFP4_CKPT": cfg["layout"]["super"][0], "CUDA_VISIBLE_DEVICES": ""})
-        for f in ("gemm_sm90.ptx",):
+        for f in ("gemm_sm90.ptx", "fused_marlin.ttgir"):
             src = Path("/probe/w4a8") / f
             if src.exists():
                 (d / f).write_bytes(src.read_bytes())
@@ -167,26 +170,67 @@ def serve_stage(attempt, variants):
         volume.commit()
 
 
+SERVE2_TIMEOUT = int(os.environ.get("SERVE2_TIMEOUT", "3600"))
+
+
+@app.function(image=image, gpu="H200", cpu=16, memory=262144, timeout=SERVE2_TIMEOUT, retries=0,
+              max_containers=1, scaledown_window=2, volumes={"/cache": volume})
+def serve2_stage(attempt, cfg):
+    """Full-model vLLM comparison (modal_runs/serve_bench.py): stock Marlin A16 vs hybrid W4A8."""
+    d = _evidence("serve2", attempt)
+    out = {"status": "RUNNING", "cfg": cfg}
+    try:
+        for tag in cfg["serve_models"].split(","):
+            nv = cfg["layout"][tag][0]
+            od = d / tag
+            native(["/usr/bin/python3", "-u", "modal_runs/serve_bench.py", "--model", nv, "--out", str(od),
+                    "--bf16", cfg["layout"][tag][1],
+                    "--variants", cfg["serve_variants"], "--workloads", cfg["serve_workloads"],
+                    "--max-len", str(cfg["serve_max_len"]), *(["--profile"] if cfg.get("serve_profile") else []),
+                    "--evals", cfg.get("serve_evals", "")],
+                   cfg["serve_deadline"][tag],
+                   env=cfg.get("env", {}))
+            f = od / "result.json"
+            out[tag] = json.loads(f.read_text()) if f.exists() else {"status": "HARNESS_FAIL"}
+            volume.commit()
+        out["status"] = "DONE"
+        return out
+    finally:
+        volume.commit()
+
+
 @app.local_entrypoint()
 def main(stage: str = "cpu", variants: str = "NVFP4_W4A8"):
-    assert stage in ("cpu", "op", "bench", "serve")
+    assert stage in ("cpu", "op", "bench", "serve", "serve2")
     # every script a GPU stage launches must exist at its repo-relative path (cwd=/probe/w4a8)
-    for rel in ("tests/gpu_operator_check.py", "tests/bench_baselines.py", "modal_runs/serve_worker.py"):
+    for rel in ("tests/gpu_operator_check.py", "tests/bench_baselines.py", "modal_runs/serve_worker.py",
+                "modal_runs/serve_bench.py"):
         assert (REPO / rel).is_file(), f"missing {rel}"
     b = binding()
-    if stage in ("op", "bench", "serve"):
+    if stage in ("op", "bench", "serve", "serve2"):
         gate = json.loads((HERE / "cpu-PASS.json").read_text())
         assert gate["status"] == "CPU_PASS" and gate["binding"] == b, "re-run --stage cpu for this source"
     if stage == "serve":
         og = json.loads((HERE / "op-PASS.json").read_text())
         assert og["status"] == "PASS" and og.get("binding") == b, "operator gate must pass first"
     attempt = f"{stage}-{uuid.uuid4().hex[:10]}"
-    fn = {"cpu": cpu_stage, "op": op_stage, "bench": bench_stage, "serve": serve_stage}[stage]
+    fn = {"cpu": cpu_stage, "op": op_stage, "bench": bench_stage, "serve": serve_stage,
+          "serve2": serve2_stage}[stage]
     cfg = {"layout": LAYOUT, "groups": BENCH_GROUPS, "models": BENCH_MODELS, "Ms": BENCH_MS,
-           "env": {k: os.environ[k] for k in ("BENCH_PROBE_MARLIN", "BENCH_HYBRID_THR", "SUPER_W4A8_MODE")
+           "env": {k: os.environ[k] for k in ("BENCH_PROBE_MARLIN", "BENCH_HYBRID_THR", "SUPER_W4A8_MODE",
+                             "SUPER_W4A8_DENSE_MIN_TOKENS", "SUPER_W4A8_SHARE_CODES", "BENCH_FM_CFGS",
+                             "BENCH_KPROF", "SUPER_W4A8_FUSED_ACT", "SUPER_W4A8_FUSED_MIN_TOKENS")
                    if k in os.environ},
            "deadline": {"super": int(os.environ.get("BENCH_DL_SUPER", "700")),
-                        "lightning": int(os.environ.get("BENCH_DL_LIGHT", "400"))}}
+                        "lightning": int(os.environ.get("BENCH_DL_LIGHT", "400"))},
+           "serve_models": os.environ.get("SERVE_MODELS", "lightning"),
+           "serve_variants": os.environ.get("SERVE_VARIANTS", "A16,HYBRID"),
+           "serve_workloads": os.environ.get("SERVE_WORKLOADS", "prefill,mixed,decode,latency1"),
+           "serve_max_len": int(os.environ.get("SERVE_MAX_LEN", "32768")),
+           "serve_profile": os.environ.get("SERVE_PROFILE") == "1",
+           "serve_evals": os.environ.get("SERVE_EVALS", ""),
+           "serve_deadline": {"lightning": int(os.environ.get("SERVE_DL_LIGHT", "1500")),
+                              "super": int(os.environ.get("SERVE_DL_SUPER", "2400"))}}
     call = fn.spawn(attempt, variants) if stage == "serve" else fn.spawn(attempt, cfg)
     meta = {"attempt": attempt, "call_id": call.object_id, "base_image": BASE,
             "profile": os.environ.get("MODAL_PROFILE"), "binding": b, "cfg": cfg}
