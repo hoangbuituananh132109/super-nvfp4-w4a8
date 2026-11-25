@@ -51,7 +51,7 @@ image = ((modal.Image.from_registry(BASE[len("registry:"):]).entrypoint([])
           if BASE.startswith("registry:") else modal.Image.from_id(BASE))
          .run_commands("/usr/bin/python3 -m pip install -q pytest safetensors")
          # lm-eval in its own venv (talks to the vLLM server over HTTP; must not touch vLLM's deps)
-         .run_commands("/usr/bin/python3 -m venv /opt/lmeval && /opt/lmeval/bin/pip install -q 'lm-eval[api]==0.4.9'")
+         .run_commands("/usr/bin/python3 -m venv /opt/lmeval && /opt/lmeval/bin/pip install -q 'lm-eval[api]==0.4.9' 'transformers>=4.48,<4.58'")
          .add_local_dir(str(REPO), "/probe/w4a8", copy=True,
                         ignore=["**/__pycache__/**", "**/*.json", "**/*.pt", "**/*.log", "**/*.ptx",
                                 ".git/**", ".pytest_cache/**"])

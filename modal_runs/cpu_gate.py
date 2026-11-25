@@ -356,11 +356,22 @@ def check_cuda_ext(res):
     res["cuda_ext"]["built"] = True
 
 
+def check_lmeval(res):
+    """lm-eval venv must import (it runs against the server in serve2 --evals)."""
+    if not Path("/opt/lmeval/bin/lm_eval").exists():
+        res["lmeval"] = "not installed"
+        return
+    r = subprocess.run(["/opt/lmeval/bin/python", "-c", "import lm_eval.evaluator, lm_eval.models; print('ok')"],
+                       capture_output=True, text=True, timeout=600)
+    res["lmeval"] = (r.stdout + r.stderr)[-1500:]
+    assert r.returncode == 0, res["lmeval"]
+
+
 def main():
     res = {"status": "RUNNING", "binding": binding(), "checks": {}}
     ok = True
     for name, fn in (("pytest", check_pytest), ("plugin", check_plugin), ("ckpt", check_ckpt),
-                     ("compile", check_compile), ("cuda_ext", check_cuda_ext)):
+                     ("compile", check_compile), ("cuda_ext", check_cuda_ext), ("lmeval", check_lmeval)):
         try:
             fn(res)
             res["checks"][name] = "PASS"

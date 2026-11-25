@@ -6,7 +6,7 @@ on H200 (SM90), served through vLLM.**
 > Status (2026-11-25): **research prototype, full-model serve measured.** On Super 120B (1× H200,
 > vLLM 0.33, CUDA graphs) the hybrid path is faster than stock Marlin NVFP4 W4A16 everywhere except
 > batch-1 decode (parity), matches MXFP4 W4A8 on prefill, beats it at batch 1, and is still behind it
-> on batched decode. Not production-hardened (no model-level accuracy evals yet).
+> on batched decode. GSM8K matches Marlin W4A16 within stderr. Not production-hardened.
 
 ## Why
 
@@ -31,6 +31,23 @@ on H200 (SM90), served through vLLM.**
 
 All variants answer 8/8 arithmetic QA probes. First-token top-20 symmetric KL vs Marlin A16:
 hybrid 0.015, MXFP4 0.021.
+
+**GSM8K** (lm-eval-harness 0.4.9, 5-shot, greedy, completions API, full 1319 questions,
+`SERVE_EVALS=gsm8k`). Stderr is about ±0.7.
+
+| Super 120B | strict-match | flexible-extract |
+|---|---:|---:|
+| Marlin NVFP4 W4A16 | 92.80 | 93.40 |
+| **NVFP4 W4A8 hybrid** | **93.10** | **93.86** |
+| MXFP4 W4A8 | 92.27 | 92.95 |
+
+| Lightning 30B (stderr about ±1.0) | strict-match | flexible-extract |
+|---|---:|---:|
+| Marlin NVFP4 W4A16 | 83.47 | 84.53 |
+| **NVFP4 W4A8 hybrid** | **82.49** | **84.15** |
+
+With 128 concurrent 5-shot requests, most steps exceed 2048 tokens, so the FP8 prefill path is
+exercised. Decode steps use Marlin.
 
 Nemotron-3 Lightning 30B (E128, top-6, H2688, I1856), same harness, total tok/s:
 
@@ -155,7 +172,7 @@ checkpoint-layout expert tensors are freed after Marlin repacking.
 
 ## Known limitations / next steps
 
-- **Accuracy evals:** model-level evals (MMLU/GSM8K-class) are not done. Only layer rel-L2, QA
+- **Accuracy evals:** GSM8K is done (above). Broader evals (MMLU, long-context, code) are not done yet. Before that, only layer rel-L2, QA
   probes and first-token KL have been measured.
 - **Batched decode:** this regime stays at Marlin W4A16 speed (see above).
 - **Prefill:** remaining ideas are a better-tuned FP8 grouped GEMM (vLLM's runs at about 36% of
