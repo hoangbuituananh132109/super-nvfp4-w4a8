@@ -151,6 +151,17 @@ routing 0.3 ms.
 | `modal_runs/` | Modal launcher: CPU gate (pytest, AOT `sm_90a` compile, ptxas spills, nvcc build) bound to source hashes; GPU stages `op` / `bench` / `serve2` (full vLLM serve, `SERVE_PROFILE=1` for kernel traces) |
 | `third_party/super_mxfp4a8/` | MXFP4 W4A8 baseline adapter used for the comparisons (not included in this repo) |
 
+## Quickstart on a GPU box (scripts/)
+
+```bash
+bash scripts/install.sh                      # pip install into the vLLM env, check versions, pre-build CUDA ops
+MODEL_PATH=/path/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 GPUS=0,1 VARIANT=w4a8 bash scripts/serve.sh   # TP1 replica per GPU, ports 8000, 8001
+PORT=8000 bash scripts/smoke_http.sh         # /v1/models, chat (thinking off/on), completions
+PORT=8000 TAG=w4a8 TOKENIZER_PATH=$MODEL_PATH bash scripts/bench.sh   # prefill / mixed / decode / batch-1
+```
+
+`VARIANT=marlin` serves the same checkpoint with stock vLLM Marlin W4A16, as the baseline.
+
 ## Use in vLLM
 
 ```bash
