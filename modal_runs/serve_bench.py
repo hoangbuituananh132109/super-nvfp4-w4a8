@@ -37,8 +37,16 @@ LOGPROB_PROMPTS = ["The capital of France is", "def fibonacci(n):\n    ", "In 19
                    "Một năm có", "The derivative of x^2 is"]
 WORKLOADS = [("prefill", 8192, 1, 64, None), ("mixed", 1024, 256, 256, None), ("mixed2", 1024, 256, 256, None),
              ("decode", 128, 512, 128, 128), ("latency1", 512, 256, 8, 1)]
-VARIANTS = {"A16": (["--moe-backend", "marlin"], {}),
-            "HYBRID": (["--quantization", "super_nvfp4_w4a8"], {"SUPER_W4A8_MODE": "hybrid"}),
+VARIANTS = {"A16": (["--moe-backend", "marlin"], {"VLLM_PLUGINS": ""}),
+            "AUTO": ([], {"VLLM_PLUGINS": ""}),   # vLLM's default NVFP4 MoE backend (Humming on SM90 in main)
+            "HUMMING": (["--moe-backend", "humming"], {"VLLM_PLUGINS": ""}),
+            # the vLLM PR branch backend (needs W4A8_VLLM_OVERLAY at image build)
+            "PR": (["--moe-backend", "marlin_fp8_prefill"], {"VLLM_PLUGINS": ""}),
+            # vLLM main's own NVFP4 x FP8 path on Hopper: Humming with FP8 activations
+            "HUMMING_FP8": (["--moe-backend", "humming"], {"VLLM_PLUGINS": "",
+                            "VLLM_HUMMING_INPUT_QUANT_CONFIG": '{"dtype":"float8e4m3"}'}),
+            "HYBRID": (["--quantization", "super_nvfp4_w4a8"], {"SUPER_W4A8_MODE": "hybrid",
+                                                               "VLLM_PLUGINS": "super_nvfp4_w4a8"}),
             "FUSED": (["--quantization", "super_nvfp4_w4a8"], {"SUPER_W4A8_MODE": "fused"}),
             # MXFP4 W4A8 baseline: FlashInfer SM90 "Humming" kernel, quantised online from the BF16
             # checkpoint by the handoff adapter (third_party/super_mxfp4a8)
@@ -70,7 +78,7 @@ def start(model, extra, env, eager, max_len, log_path, ready_s, profile_dir=None
     def pump():
         for line in p.stdout:
             log.write(line); log.flush()
-            if any(t in line for t in ("SUPER_", "Error", "error", "Traceback", "KV cache", "memory",
+            if any(t in line for t in ("SUPER_", "Error", "error", "Traceback", "KV cache", "memory", "backend",
                                        "Application startup complete", "CUDA graph", "Loading weights took")):
                 print("[serve]", line.rstrip()[:400], flush=True)
     threading.Thread(target=pump, daemon=True).start()

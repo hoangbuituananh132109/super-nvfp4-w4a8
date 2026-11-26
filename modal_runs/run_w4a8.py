@@ -33,7 +33,8 @@ _LAYOUT = {
     "split": {"super": ("/cache/models/SuperNVFP4/ff433f5493e25d631c9f12b5d55c674229923d02",
                          "/cache/models/SuperBF16/2dc98e2afe4face0e4ce40972a915c45368bd34a"),
                "lightning": ("/cache/models/NVFP4/bee7596271d1495f6992ae224aefde4410e816b8",
-                             "/cache/models/BF16/a9904d24bcc1d289a1950fa9d2b978c47cf903b9")},
+                             "/cache/models/BF16/a9904d24bcc1d289a1950fa9d2b978c47cf903b9"),
+               "qwen3": ("/cache/models/Qwen3-30B-A3B-NVFP4/2538ded2a4edb247b4d2b4a8ba24e44bd4c017c3", "")},
 }
 LAYOUT = _LAYOUT[os.environ.get("W4A8_LAYOUT", "split")]
 NVFP4, BF16 = LAYOUT["super"]
@@ -57,6 +58,11 @@ image = ((modal.Image.from_registry(BASE[len("registry:"):]).entrypoint([])
                                 ".git/**", ".pytest_cache/**"])
          .run_commands("/usr/bin/python3 -m pip install --no-deps --no-build-isolation /probe/w4a8 "
                        "/probe/w4a8/third_party/super_mxfp4a8"))
+OVERLAY = os.environ.get("W4A8_VLLM_OVERLAY")  # dir holding vllm/... files of a vLLM PR branch
+if OVERLAY:
+    image = (image.add_local_dir(OVERLAY, "/overlay", copy=True)
+             .run_commands("cp -rv /overlay/vllm/. \"$(/usr/bin/python3 -c 'import vllm, os; "
+                           "print(os.path.dirname(vllm.__file__))')\"/"))
 
 
 def binding():
@@ -229,7 +235,8 @@ def main(stage: str = "cpu", variants: str = "NVFP4_W4A8"):
            "serve_max_len": int(os.environ.get("SERVE_MAX_LEN", "32768")),
            "serve_profile": os.environ.get("SERVE_PROFILE") == "1",
            "serve_evals": os.environ.get("SERVE_EVALS", ""),
-           "serve_deadline": {"lightning": int(os.environ.get("SERVE_DL_LIGHT", "1500")),
+           "serve_deadline": {"qwen3": int(os.environ.get("SERVE_DL_QWEN", "2400")),
+                              "lightning": int(os.environ.get("SERVE_DL_LIGHT", "1500")),
                               "super": int(os.environ.get("SERVE_DL_SUPER", "2400"))}}
     call = fn.spawn(attempt, variants) if stage == "serve" else fn.spawn(attempt, cfg)
     meta = {"attempt": attempt, "call_id": call.object_id, "base_image": BASE,

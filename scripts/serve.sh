@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Host Nemotron-3 Super NVFP4 with vLLM: one TP1 replica per GPU (the plugin is TP1/EP1 only).
 #
-#   MODEL_PATH=/path/to/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 GPUS=0,1 VARIANT=w4a8 bash scripts/serve.sh
+#   MODEL_PATH=/path/to/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 GPUS=0,1 VARIANT=auto bash scripts/serve.sh
 #
 # VARIANT=w4a8   : this repo (--quantization super_nvfp4_w4a8, hybrid Marlin / FP8 prefill)
-# VARIANT=marlin : stock vLLM NVFP4 W4A16 Marlin, same checkpoint (baseline)
+# VARIANT=auto   : vLLM's default (Humming W4A16 on H200), recommended for production
+# VARIANT=marlin : vLLM NVFP4 W4A16 with Marlin forced
 # Replica i listens on BASE_PORT + i; logs go to $LOG_DIR/serve_<variant>_gpu<id>.log
 set -euo pipefail
 : "${MODEL_PATH:?set MODEL_PATH to the ModelOpt NVFP4 checkpoint}"
-VARIANT=${VARIANT:-w4a8}
+VARIANT=${VARIANT:-auto}
 GPUS=${GPUS:-0}
 BASE_PORT=${BASE_PORT:-8000}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-Nemotron-3-Super-120B-A12B-NVFP4}
@@ -26,7 +27,8 @@ mkdir -p "$LOG_DIR"
 case "$VARIANT" in
   w4a8)   QARGS=(--quantization super_nvfp4_w4a8) ;;
   marlin) QARGS=(--moe-backend marlin) ;;
-  *) echo "VARIANT must be w4a8 or marlin"; exit 1 ;;
+  auto)   QARGS=() ;;
+  *) echo "VARIANT must be w4a8, auto or marlin"; exit 1 ;;
 esac
 
 IFS=',' read -ra GPU_LIST <<< "$GPUS"

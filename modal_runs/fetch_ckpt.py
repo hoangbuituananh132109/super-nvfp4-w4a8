@@ -23,6 +23,7 @@ CKPTS = {
                     "ff433f5493e25d631c9f12b5d55c674229923d02", "SuperNVFP4"),
     "super-bf16": ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
                    "2dc98e2afe4face0e4ce40972a915c45368bd34a", "SuperBF16"),
+    "qwen3-30b-nvfp4": ("nvidia/Qwen3-30B-A3B-NVFP4", "2538ded2a4edb247b4d2b4a8ba24e44bd4c017c3", "Qwen3-30B-A3B-NVFP4"),
 }
 VOLUME = os.environ.get("W4A8_VOLUME", "nemotron-models")
 
