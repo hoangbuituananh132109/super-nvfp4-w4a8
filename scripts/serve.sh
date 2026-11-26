@@ -13,6 +13,8 @@ GPUS=${GPUS:-0}
 BASE_PORT=${BASE_PORT:-8000}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-Nemotron-3-Super-120B-A12B-NVFP4}
 TOKENIZER_PATH=${TOKENIZER_PATH:-$MODEL_PATH}
+# the CUDA kernels are JIT-built once into this cache; it must be writable (set it if HOME is read-only)
+export TORCH_EXTENSIONS_DIR=${TORCH_EXTENSIONS_DIR:-$HOME/.cache/torch_extensions}
 GPU_MEM=${GPU_MEM:-0.95}
 MAX_BATCHED=${MAX_BATCHED:-16384}
 MAX_SEQS=${MAX_SEQS:-512}

@@ -3,7 +3,7 @@
 #   bash scripts/install.sh            # from the repo root (the hfd --local-dir)
 set -euo pipefail
 cd "$(dirname "$0")/.."
-PY=${PYTHON:-python}
+PY=${PYTHON:-python3}
 
 $PY -m pip install --no-deps --no-build-isolation -q .
 $PY - <<'EOF'

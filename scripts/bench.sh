@@ -7,7 +7,7 @@ HOST=${HOST:-127.0.0.1}; PORT=${PORT:-8000}; TAG=${TAG:-run}
 OUT_DIR=${OUT_DIR:-./bench_results}
 : "${TOKENIZER_PATH:?set TOKENIZER_PATH (usually the checkpoint dir)}"
 URL="http://$HOST:$PORT"
-MODEL=$(curl -s "$URL/v1/models" | python -c "import sys, json; print(json.load(sys.stdin)['data'][0]['id'])")
+MODEL=$(curl -s "$URL/v1/models" | python3 -c "import sys, json; print(json.load(sys.stdin)['data'][0]['id'])")
 mkdir -p "$OUT_DIR/$TAG"
 # name  in   out  prompts  concurrency(0 = unbounded)
 WORKLOADS=${WORKLOADS:-"prefill:8192:1:64:0 mixed:1024:256:256:0 decode:128:512:128:128 latency1:512:256:8:1"}
@@ -18,7 +18,7 @@ for w in $WORKLOADS; do
     --trust-remote-code --dataset-name random --random-input-len "$il" --random-output-len "$ol" \
     --num-prompts "$n" --request-rate inf --ignore-eos --seed 1234 \
     --save-result --result-dir "$OUT_DIR/$TAG" --result-filename "$name.json" "${extra[@]}" > "$OUT_DIR/$TAG/$name.log" 2>&1
-  python - "$OUT_DIR/$TAG/$name.json" "$name" <<'EOF'
+  python3 - "$OUT_DIR/$TAG/$name.json" "$name" <<'EOF'
 import json, sys
 d = json.load(open(sys.argv[1]))
 print(f"{sys.argv[2]:9s} total_tok/s={d['total_token_throughput']:9.0f}  out_tok/s={d['output_throughput']:8.0f}  "
